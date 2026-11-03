@@ -10,3 +10,4 @@ pydantic
 rapidocr
 opencv-python-headless
 numpy
+onnxruntime
