@@ -1,5 +1,6 @@
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -9,18 +10,30 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from starlette.concurrency import run_in_threadpool
+
 
 # --------------------------------------------------
-# ENVIRONMENT
+# ENVIRONMENT AND LOGGING
 # --------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+
+logger = logging.getLogger("medimind")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing from .env")
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
 
 # --------------------------------------------------
 # DATABASE - SUPABASE POSTGRESQL
@@ -30,8 +43,10 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"sslmode": "require"},
     pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=2,
+    pool_size=2,
+    max_overflow=1,
+    pool_timeout=30,
+    pool_recycle=1800,
 )
 
 
@@ -60,10 +75,38 @@ def initialize_database():
             )
         """))
 
-        connection.execute(text("""
+        # Additive migrations: preserve all existing records.
+
+        migrations = [
+            """
             ALTER TABLE medications
             ADD COLUMN IF NOT EXISTS verification_note TEXT
-        """))
+            """,
+            """
+            ALTER TABLE medications
+            ADD COLUMN IF NOT EXISTS raw_transcription TEXT
+            """,
+            """
+            ALTER TABLE medications
+            ADD COLUMN IF NOT EXISTS name_confidence VARCHAR(10)
+            DEFAULT 'low'
+            """,
+            """
+            ALTER TABLE medications
+            ADD COLUMN IF NOT EXISTS dosage_confidence VARCHAR(10)
+            DEFAULT 'low'
+            """,
+            """
+            ALTER TABLE medications
+            ADD COLUMN IF NOT EXISTS frequency_confidence VARCHAR(10)
+            DEFAULT 'low'
+            """
+        ]
+
+        for migration in migrations:
+            connection.execute(text(migration))
+
+    logger.info("Database initialization completed.")
 
 
 initialize_database()
@@ -89,6 +132,11 @@ class MedicationResponse(BaseModel):
     duration_days: Optional[int] = None
     verification_note: Optional[str] = None
 
+    raw_transcription: Optional[str] = None
+    name_confidence: str = "low"
+    dosage_confidence: str = "low"
+    frequency_confidence: str = "low"
+
 
 class PrescriptionResponse(BaseModel):
     id: int
@@ -103,13 +151,13 @@ class PrescriptionResponse(BaseModel):
 app = FastAPI(
     title="MediMind API",
     description="AI-powered prescription extraction and management",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -125,15 +173,22 @@ def decode_times(value):
 
     try:
         decoded = json.loads(value)
+
         if isinstance(decoded, list):
             return decoded
+
     except (json.JSONDecodeError, TypeError):
         pass
 
-    return [item.strip() for item in value.split(",") if item.strip()]
+    return [
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    ]
 
 
 def save_prescription(extraction):
+
     with engine.begin() as connection:
 
         result = connection.execute(
@@ -142,12 +197,15 @@ def save_prescription(extraction):
                 VALUES (:doctor_notes)
                 RETURNING id
             """),
-            {"doctor_notes": extraction.doctor_notes}
+            {
+                "doctor_notes": extraction.doctor_notes
+            }
         )
 
         prescription_id = result.scalar_one()
 
         for medication in extraction.medications:
+
             connection.execute(
                 text("""
                     INSERT INTO medications (
@@ -158,7 +216,11 @@ def save_prescription(extraction):
                         times_of_day,
                         duration_days,
                         instructions,
-                        verification_note
+                        verification_note,
+                        raw_transcription,
+                        name_confidence,
+                        dosage_confidence,
+                        frequency_confidence
                     )
                     VALUES (
                         :prescription_id,
@@ -168,7 +230,11 @@ def save_prescription(extraction):
                         :times_of_day,
                         :duration_days,
                         :instructions,
-                        :verification_note
+                        :verification_note,
+                        :raw_transcription,
+                        :name_confidence,
+                        :dosage_confidence,
+                        :frequency_confidence
                     )
                 """),
                 {
@@ -176,10 +242,16 @@ def save_prescription(extraction):
                     "name": medication.name,
                     "dosage": medication.dosage,
                     "frequency_per_day": medication.frequency_per_day,
-                    "times_of_day": json.dumps(medication.times_of_day),
+                    "times_of_day": json.dumps(
+                        medication.times_of_day
+                    ),
                     "duration_days": medication.duration_days,
                     "instructions": medication.instructions,
                     "verification_note": medication.verification_note,
+                    "raw_transcription": medication.raw_transcription,
+                    "name_confidence": medication.name_confidence,
+                    "dosage_confidence": medication.dosage_confidence,
+                    "frequency_confidence": medication.frequency_confidence,
                 }
             )
 
@@ -187,6 +259,7 @@ def save_prescription(extraction):
 
 
 def build_prescription_response(prescription_id):
+
     with engine.connect() as connection:
 
         prescription = connection.execute(
@@ -210,12 +283,18 @@ def build_prescription_response(prescription_id):
                     times_of_day,
                     frequency_per_day,
                     duration_days,
-                    verification_note
+                    verification_note,
+                    raw_transcription,
+                    name_confidence,
+                    dosage_confidence,
+                    frequency_confidence
                 FROM medications
                 WHERE prescription_id = :prescription_id
                 ORDER BY id
             """),
-            {"prescription_id": prescription_id}
+            {
+                "prescription_id": prescription_id
+            }
         ).mappings().all()
 
         return PrescriptionResponse(
@@ -226,10 +305,16 @@ def build_prescription_response(prescription_id):
                     name=medication["name"] or "",
                     dosage=medication["dosage"] or "",
                     instructions=medication["instructions"] or "",
-                    times_of_day=decode_times(medication["times_of_day"]),
+                    times_of_day=decode_times(
+                        medication["times_of_day"]
+                    ),
                     frequency_per_day=medication["frequency_per_day"],
                     duration_days=medication["duration_days"],
                     verification_note=medication["verification_note"],
+                    raw_transcription=medication["raw_transcription"],
+                    name_confidence=medication["name_confidence"] or "low",
+                    dosage_confidence=medication["dosage_confidence"] or "low",
+                    frequency_confidence=medication["frequency_confidence"] or "low",
                 )
                 for medication in medications
             ]
@@ -242,16 +327,19 @@ def build_prescription_response(prescription_id):
 
 @app.get("/")
 def home():
+
     return {
         "message": "MediMind API is running",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "database": "Supabase PostgreSQL"
     }
 
 
 @app.get("/api/v1/prescriptions")
 def get_prescriptions():
+
     with engine.connect() as connection:
+
         prescriptions = connection.execute(
             text("""
                 SELECT id
@@ -272,11 +360,11 @@ def get_prescriptions():
 )
 async def parse_prescription(file: UploadFile = File(...)):
 
-    allowed_types = [
+    allowed_types = {
         "image/jpeg",
         "image/png",
         "image/webp"
-    ]
+    }
 
     if file.content_type not in allowed_types:
         raise HTTPException(
@@ -284,38 +372,72 @@ async def parse_prescription(file: UploadFile = File(...)):
             detail="Only JPEG, PNG and WEBP images are supported."
         )
 
-    image_bytes = await file.read()
-
-    if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Image exceeds the 10 MB upload limit."
-        )
-
-    if not image_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded image is empty."
-        )
-
     try:
-        extraction = parse_prescription_image(
+        image_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+
+        if len(image_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Image exceeds the 10 MB upload limit."
+            )
+
+        if not image_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded image is empty."
+            )
+
+        logger.info(
+            "Prescription received: filename=%s size=%s content_type=%s",
+            file.filename,
+            len(image_bytes),
+            file.content_type
+        )
+
+        # Run synchronous AI processing outside the event loop.
+        extraction = await run_in_threadpool(
+            parse_prescription_image,
             image_bytes,
             file.content_type
         )
 
         prescription_id = save_prescription(extraction)
 
-        response = build_prescription_response(prescription_id)
+        result = build_prescription_response(prescription_id)
 
-        return response
+        logger.info(
+            "Prescription saved successfully: id=%s medications=%s",
+            prescription_id,
+            len(extraction.medications)
+        )
+
+        return result
 
     except HTTPException:
         raise
 
-    except Exception as error:
-        print(f"Prescription processing error: {error}")
+    except ValueError as error:
+        logger.warning(
+            "Prescription image or extraction validation failed: %s",
+            error
+        )
+
+        raise HTTPException(
+            status_code=422,
+            detail=str(error)
+        )
+
+    except Exception:
+        logger.exception("Prescription processing failed.")
+
         raise HTTPException(
             status_code=500,
-            detail="Prescription processing failed. Check backend logs."
+            detail=(
+                "Prescription processing failed. "
+                "Please try again later."
+            )
         )
+
+    finally:
+        await file.close()
+
