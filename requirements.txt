@@ -7,7 +7,3 @@ sqlalchemy
 psycopg[binary]
 openai
 pydantic
-rapidocr
-opencv-python-headless
-numpy
-onnxruntime
