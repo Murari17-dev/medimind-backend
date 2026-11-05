@@ -1,4 +1,3 @@
-
 import json
 import logging
 import os
@@ -115,7 +114,6 @@ def initialize_database():
 
         for migration in migrations:
             connection.execute(text(migration))
-
 
         # Medication reminders and durable delivery claims.
         connection.execute(text("""
@@ -463,6 +461,58 @@ def get_prescriptions(current_user: dict = Depends(get_current_user)):
     ]
 
 
+@app.delete("/api/v1/prescriptions/{prescription_id}")
+def delete_prescription(
+    prescription_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    # The owner check is part of the DELETE itself. A prescription belonging
+    # to another account is indistinguishable from a nonexistent prescription.
+    with engine.begin() as connection:
+        deleted = connection.execute(
+            text("""
+                DELETE FROM prescriptions
+                WHERE id = :prescription_id
+                  AND user_id = CAST(:user_id AS UUID)
+                RETURNING id
+            """),
+            {
+                "prescription_id": prescription_id,
+                "user_id": current_user["id"],
+            },
+        ).scalar_one_or_none()
+
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="Prescription not found.")
+
+    # Existing FK rules cascade-delete its medications and set linked
+    # medication_reminders.prescription_id to NULL, preserving those reminders.
+    return {
+        "deleted": True,
+        "prescription_id": deleted,
+    }
+
+
+@app.delete("/api/v1/prescriptions")
+def delete_all_prescriptions(current_user: dict = Depends(get_current_user)):
+    # Only rows owned by the authenticated user are selected for deletion.
+    # Legacy rows with user_id NULL and every other user's rows remain untouched.
+    with engine.begin() as connection:
+        deleted_ids = connection.execute(
+            text("""
+                DELETE FROM prescriptions
+                WHERE user_id = CAST(:user_id AS UUID)
+                RETURNING id
+            """),
+            {"user_id": current_user["id"]},
+        ).scalars().all()
+
+    return {
+        "deleted": True,
+        "deleted_count": len(deleted_ids),
+    }
+
+
 @app.post(
     "/api/v1/parse-prescription",
     response_model=PrescriptionResponse
@@ -552,4 +602,3 @@ async def parse_prescription(
 
     finally:
         await file.close()
-
