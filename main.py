@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import httpx
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -28,9 +30,13 @@ logging.basicConfig(
 logger = logging.getLogger("medimind")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is missing from .env")
+    raise RuntimeError("DATABASE_URL is missing from environment variables")
+if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
@@ -75,9 +81,13 @@ def initialize_database():
             )
         """))
 
-        # Additive migrations: preserve all existing records.
+        # Additive migrations: preserve existing records. Legacy rows remain
+        # unassigned (user_id NULL) and are never exposed to new accounts.
+        connection.execute(text("ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS user_id UUID"))
+        connection.execute(text("ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"))
 
         migrations = [
+            "ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS user_id UUID",
             """
             ALTER TABLE medications
             ADD COLUMN IF NOT EXISTS verification_note TEXT
@@ -163,6 +173,38 @@ app.add_middleware(
 )
 
 
+# Supabase Auth validates access tokens. The publishable key is public by design;
+# never place a service-role key in the frontend.
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+
+    token = credentials.credentials
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "apikey": SUPABASE_PUBLISHABLE_KEY,
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Your session is invalid or expired. Please sign in again.")
+        user = response.json()
+        if not user.get("id"):
+            raise HTTPException(status_code=401, detail="Unable to verify your account.")
+        return user
+    except httpx.HTTPError:
+        logger.exception("Supabase Auth verification failed")
+        raise HTTPException(status_code=503, detail="Authentication service is temporarily unavailable.")
+
+
 # --------------------------------------------------
 # DATABASE HELPERS
 # --------------------------------------------------
@@ -187,18 +229,19 @@ def decode_times(value):
     ]
 
 
-def save_prescription(extraction):
+def save_prescription(extraction, user_id):
 
     with engine.begin() as connection:
 
         result = connection.execute(
             text("""
-                INSERT INTO prescriptions (doctor_notes)
-                VALUES (:doctor_notes)
+                INSERT INTO prescriptions (doctor_notes, user_id)
+                VALUES (:doctor_notes, CAST(:user_id AS UUID))
                 RETURNING id
             """),
             {
-                "doctor_notes": extraction.doctor_notes
+                "doctor_notes": extraction.doctor_notes,
+                "user_id": user_id
             }
         )
 
@@ -258,7 +301,7 @@ def save_prescription(extraction):
     return prescription_id
 
 
-def build_prescription_response(prescription_id):
+def build_prescription_response(prescription_id, user_id):
 
     with engine.connect() as connection:
 
@@ -266,9 +309,9 @@ def build_prescription_response(prescription_id):
             text("""
                 SELECT id, doctor_notes
                 FROM prescriptions
-                WHERE id = :id
+                WHERE id = :id AND user_id = CAST(:user_id AS UUID)
             """),
-            {"id": prescription_id}
+            {"id": prescription_id, "user_id": user_id}
         ).mappings().first()
 
         if not prescription:
@@ -336,7 +379,7 @@ def home():
 
 
 @app.get("/api/v1/prescriptions")
-def get_prescriptions():
+def get_prescriptions(current_user: dict = Depends(get_current_user)):
 
     with engine.connect() as connection:
 
@@ -344,12 +387,14 @@ def get_prescriptions():
             text("""
                 SELECT id
                 FROM prescriptions
-                ORDER BY id DESC
-            """)
+                WHERE user_id = CAST(:user_id AS UUID)
+                ORDER BY created_at DESC, id DESC
+            """),
+            {"user_id": current_user["id"]}
         ).fetchall()
 
     return [
-        build_prescription_response(row.id)
+        build_prescription_response(row.id, current_user["id"])
         for row in prescriptions
     ]
 
@@ -358,7 +403,10 @@ def get_prescriptions():
     "/api/v1/parse-prescription",
     response_model=PrescriptionResponse
 )
-async def parse_prescription(file: UploadFile = File(...)):
+async def parse_prescription(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
 
     allowed_types = {
         "image/jpeg",
@@ -401,9 +449,9 @@ async def parse_prescription(file: UploadFile = File(...)):
             file.content_type
         )
 
-        prescription_id = save_prescription(extraction)
+        prescription_id = save_prescription(extraction, current_user["id"])
 
-        result = build_prescription_response(prescription_id)
+        result = build_prescription_response(prescription_id, current_user["id"])
 
         logger.info(
             "Prescription saved successfully: id=%s medications=%s",
