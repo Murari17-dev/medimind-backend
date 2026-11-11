@@ -1,13 +1,21 @@
 
 import os
+import re
 import base64
 import logging
 from io import BytesIO
+from typing import Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image, ImageEnhance, ImageOps
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,25 +24,67 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 MODEL = os.getenv("AIROUTER_MODEL", "openai/gpt-6-luna")
 AIROUTER_BASE_URL = "https://api.airouter.in/v1"
 
+# One initial extraction plus at most two repair attempts.
+MAX_REPAIR_ATTEMPTS = 2
+
+TIME_OF_DAY_LABELS = {
+    "morning": "Morning",
+    "afternoon": "Afternoon",
+    "night": "Night",
+}
+
+CLOCK_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
 logger = logging.getLogger(__name__)
 
 
 class MedicationExtraction(BaseModel):
+    model_config = ConfigDict(strict=True)
+
     name: str = "Unknown"
     dosage: str = ""
-    frequency_per_day: int = 0
+    frequency_per_day: int = Field(default=0, ge=0)
     times_of_day: list[str] = Field(default_factory=list)
-    duration_days: int = 0
+    duration_days: int = Field(default=0, ge=0)
     instructions: str = ""
     verification_note: str = ""
 
     raw_transcription: str = ""
-    name_confidence: str = "low"
-    dosage_confidence: str = "low"
-    frequency_confidence: str = "low"
+    name_confidence: Literal["high", "medium", "low"] = "low"
+    dosage_confidence: Literal["high", "medium", "low"] = "low"
+    frequency_confidence: Literal["high", "medium", "low"] = "low"
+
+    @field_validator("name")
+    @classmethod
+    def require_name(cls, value: str) -> str:
+        # An unreadable name is reported as "Unknown"; it is never invented.
+        return value.strip() or "Unknown"
+
+    @field_validator("times_of_day")
+    @classmethod
+    def validate_times_of_day(cls, value: list[str]) -> list[str]:
+        normalized = []
+
+        for item in value:
+            text = item.strip()
+            label = TIME_OF_DAY_LABELS.get(text.lower())
+
+            if label is not None:
+                normalized.append(label)
+            elif CLOCK_TIME_PATTERN.match(text):
+                normalized.append(text)
+            else:
+                raise ValueError(
+                    "times_of_day entries must be Morning, Afternoon, "
+                    "Night or a 24-hour HH:MM time."
+                )
+
+        return normalized
 
 
 class PrescriptionExtraction(BaseModel):
+    model_config = ConfigDict(strict=True)
+
     doctor_notes: str = ""
     medications: list[MedicationExtraction] = Field(
         default_factory=list
@@ -90,13 +140,24 @@ def preprocess_image(image_bytes: bytes) -> bytes:
         return output.getvalue()
 
 
-def normalize_confidence(value: str) -> str:
-    value = str(value).strip().lower()
+def describe_validation_error(error: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in item['loc']) or 'root'}: "
+        f"{item['msg']}"
+        for item in error.errors()
+    )
 
-    if value not in ("high", "medium", "low"):
-        return "low"
 
-    return value
+def build_repair_message(error: ValidationError) -> str:
+    return (
+        "The previous JSON failed validation: "
+        f"{describe_validation_error(error)}. "
+        "Return the corrected JSON only, using exactly the same "
+        "structure. Do not invent or add medication information "
+        "that is not visible in the prescription. Use 0 for unknown "
+        "numeric values, empty strings for unavailable text, and one "
+        "of high, medium or low for confidence values."
+    )
 
 
 def parse_prescription_image(
@@ -285,75 +346,97 @@ Return JSON only.
         MODEL
     )
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": instructions
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Inspect both views of this prescription. "
-                            "Transcribe every medication separately. "
-                            "Preserve partial readings, extract each "
-                            "field independently, and flag uncertainty."
-                        )
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": original_image_url
-                        }
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": enhanced_image_url
-                        }
+    messages = [
+        {
+            "role": "system",
+            "content": instructions
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Inspect both views of this prescription. "
+                        "Transcribe every medication separately. "
+                        "Preserve partial readings, extract each "
+                        "field independently, and flag uncertainty."
+                    )
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": original_image_url
                     }
-                ]
-            }
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-        max_tokens=5000
-    )
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": enhanced_image_url
+                    }
+                }
+            ]
+        }
+    ]
 
-    result = response.choices[0].message.content
+    extraction = None
+    last_error = None
 
-    if not result:
+    for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
+
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=5000
+        )
+
+        result = response.choices[0].message.content
+
+        if not result:
+            last_error = "GPT-6 Luna returned an empty response."
+            logger.warning(
+                "Prescription extraction attempt %s returned no content.",
+                attempt + 1
+            )
+            continue
+
+        try:
+            extraction = PrescriptionExtraction.model_validate_json(
+                result
+            )
+            break
+        except ValidationError as error:
+            last_error = error
+            logger.warning(
+                "Prescription extraction attempt %s failed validation: %s",
+                attempt + 1,
+                describe_validation_error(error)
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": result
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": build_repair_message(error)
+                }
+            )
+
+    if extraction is None:
+        detail = (
+            describe_validation_error(last_error)
+            if isinstance(last_error, ValidationError)
+            else last_error
+        )
         raise ValueError(
-            "GPT-6 Luna returned an empty response."
+            "Prescription extraction failed validation after "
+            f"{MAX_REPAIR_ATTEMPTS + 1} attempts: {detail}"
         )
-
-    extraction = PrescriptionExtraction.model_validate_json(
-        result
-    )
-
-    for medication in extraction.medications:
-        medication.name_confidence = normalize_confidence(
-            medication.name_confidence
-        )
-        medication.dosage_confidence = normalize_confidence(
-            medication.dosage_confidence
-        )
-        medication.frequency_confidence = normalize_confidence(
-            medication.frequency_confidence
-        )
-
-        if medication.frequency_per_day < 0:
-            medication.frequency_per_day = 0
-
-        if medication.duration_days < 0:
-            medication.duration_days = 0
-
-        if not medication.name.strip():
-            medication.name = "Unknown"
 
     logger.info(
         "Prescription extraction completed: %s medications",
