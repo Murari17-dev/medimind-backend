@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 
@@ -39,13 +40,13 @@ logger = logging.getLogger(__name__)
 
 
 class MedicationExtraction(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="forbid")
 
     name: str = "Unknown"
     dosage: str = ""
-    frequency_per_day: int = Field(default=0, ge=0)
+    frequency_per_day: int = Field(default=0, ge=0, le=24)
     times_of_day: list[str] = Field(default_factory=list)
-    duration_days: int = Field(default=0, ge=0)
+    duration_days: int = Field(default=0, ge=0, le=365)
     instructions: str = ""
     verification_note: str = ""
 
@@ -53,6 +54,28 @@ class MedicationExtraction(BaseModel):
     name_confidence: Literal["high", "medium", "low"] = "low"
     dosage_confidence: Literal["high", "medium", "low"] = "low"
     frequency_confidence: Literal["high", "medium", "low"] = "low"
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_all_fields(cls, data):
+        # A field omitted by the model is missing information, not a
+        # successful extraction. Reject it so the repair loop can retry.
+        if not isinstance(data, dict):
+            return data
+
+        missing = [
+            field_name
+            for field_name in cls.model_fields
+            if field_name not in data
+        ]
+
+        if missing:
+            raise ValueError(
+                "missing required medication fields: "
+                + ", ".join(missing)
+            )
+
+        return data
 
     @field_validator("name")
     @classmethod
@@ -81,9 +104,44 @@ class MedicationExtraction(BaseModel):
 
         return normalized
 
+    @model_validator(mode="after")
+    def note_missing_information(self):
+        # Record unavailable information instead of leaving it silent.
+        # Only the absence of data is described; nothing is invented.
+        notes = []
+
+        if self.name == "Unknown":
+            notes.append(
+                "Medication name could not be read from the prescription."
+            )
+
+        if not self.dosage:
+            notes.append(
+                "Dosage was not visible on the prescription."
+            )
+
+        if self.frequency_per_day == 0:
+            notes.append(
+                "Frequency could not be determined from the prescription."
+            )
+
+        if self.duration_days == 0:
+            notes.append(
+                "Duration was not visible on the prescription."
+            )
+
+        if notes:
+            existing = self.verification_note.strip()
+            combined = " ".join(notes)
+            self.verification_note = (
+                f"{existing} {combined}" if existing else combined
+            )
+
+        return self
+
 
 class PrescriptionExtraction(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="forbid")
 
     doctor_notes: str = ""
     medications: list[MedicationExtraction] = Field(
@@ -399,6 +457,16 @@ Return JSON only.
             logger.warning(
                 "Prescription extraction attempt %s returned no content.",
                 attempt + 1
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous response was empty. Return the JSON "
+                        "object only, using exactly the documented "
+                        "structure. Do not invent medication information."
+                    )
+                }
             )
             continue
 
