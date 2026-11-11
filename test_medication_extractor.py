@@ -1,12 +1,12 @@
 from pathlib import Path
 
-from rapidocr import RapidOCR
-
-from ocr_test import group_medication_lines
-from medication_extractor import select_medication_lines
-
 
 def main():
+    from rapidocr import RapidOCR
+
+    from ocr_test import group_medication_lines
+    from medication_extractor import select_medication_lines
+
     image_path = Path("sample_prescription.jpg")
 
     if not image_path.exists():

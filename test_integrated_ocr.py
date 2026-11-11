@@ -1,24 +1,33 @@
-from pathlib import Path
+import pytest
 
-from parser import extract_ocr_lines
+from medication_extractor import select_medication_lines
 
 
-image_path = Path("sample_prescription.jpg")
+def test_grouped_rapidocr_detections_can_be_selected():
+    # RapidOCR is optional: the production parser does not depend on it.
+    pytest.importorskip("rapidocr")
+    from ocr_test import group_medication_lines
 
-image_bytes = image_path.read_bytes()
+    boxes = [
+        [[0, 0], [30, 0], [30, 10], [0, 10]],
+        [[35, 0], [60, 0], [60, 10], [35, 10]],
+        [[0, 20], [70, 20], [70, 30], [0, 30]],
+    ]
+    texts = ["Aspirin", "75 mg", "Take daily"]
+    scores = [0.9, 0.8, 0.7]
 
-lines = extract_ocr_lines(image_bytes)
+    grouped = group_medication_lines(boxes, texts, scores)
+    selected = select_medication_lines(grouped)
 
-print("\n========== INTEGRATED OCR RESULTS ==========\n")
-
-for index, line in enumerate(lines, start=1):
-    print("Medication line:", index)
-    print("Text:", line["text"])
-    print("Confidence:", round(line["confidence"], 3))
-    print(
-        "Medication indicators:",
-        line["contains_medication_marker"]
+    assert [line["text"] for line in grouped] == [
+        "Aspirin 75 mg",
+        "Take daily",
+    ]
+    assert [line["text"] for line in selected] == [
+        "Aspirin 75 mg",
+        "Take daily",
+    ]
+    assert all(
+        line["contains_medication_marker"] for line in selected
     )
-    print("-" * 40)
-
-print("\nTotal selected lines:", len(lines))
+    assert grouped[0]["confidence"] == pytest.approx(0.85)

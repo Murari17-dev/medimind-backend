@@ -1,4 +1,3 @@
-
 import os
 import base64
 import mimetypes
@@ -7,39 +6,43 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
 
-API_KEY = os.getenv("AIROUTER_API_KEY")
+def main():
+    load_dotenv()
 
-if not API_KEY:
-    raise ValueError("AIROUTER_API_KEY not found in .env")
+    api_key = os.getenv("AIROUTER_API_KEY")
 
-client = OpenAI(
-    api_key=API_KEY,
-    base_url="https://api.airouter.in/v1"
-)
+    if not api_key:
+        raise ValueError("AIROUTER_API_KEY not found in .env")
 
-# Enter the path of the ONE image you want to analyse.
-IMAGE_PATH = input("Enter prescription image path: ").strip().strip('"')
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.airouter.in/v1"
+    )
 
-image_path = Path(IMAGE_PATH)
+    # Enter the path of the ONE image you want to analyse.
+    image_path_text = input(
+        "Enter prescription image path: "
+    ).strip().strip('"')
 
-if not image_path.is_file():
-    raise FileNotFoundError(f"Image not found: {image_path}")
+    image_path = Path(image_path_text)
 
-mime_type, _ = mimetypes.guess_type(str(image_path))
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
 
-if not mime_type or not mime_type.startswith("image/"):
-    raise ValueError("Unsupported image format.")
+    mime_type, _ = mimetypes.guess_type(str(image_path))
 
-with open(image_path, "rb") as image_file:
-    encoded_image = base64.b64encode(
-        image_file.read()
-    ).decode("utf-8")
+    if not mime_type or not mime_type.startswith("image/"):
+        raise ValueError("Unsupported image format.")
 
-image_data = f"data:{mime_type};base64,{encoded_image}"
+    with open(image_path, "rb") as image_file:
+        encoded_image = base64.b64encode(
+            image_file.read()
+        ).decode("utf-8")
 
-prompt = """
+    image_data = f"data:{mime_type};base64,{encoded_image}"
+
+    prompt = """
 You are an expert prescription-reading assistant.
 
 Carefully inspect the entire prescription image.
@@ -71,23 +74,27 @@ IMPORTANT:
 - Return valid JSON only.
 """
 
-response = client.chat.completions.create(
-    model="openai/gpt-6.1-terra",
-    messages=[
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image_data}
-                }
-            ]
-        }
-    ],
-    max_tokens=4000
-)
+    response = client.chat.completions.create(
+        model="openai/gpt-6.1-terra",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_data}
+                    }
+                ]
+            }
+        ],
+        max_tokens=4000
+    )
 
-print("\n========== GPT-6.1 TERRA RESULT ==========\n")
-print(response.choices[0].message.content)
-print("\n==========================================")
+    print("\n========== GPT-6.1 TERRA RESULT ==========\n")
+    print(response.choices[0].message.content)
+    print("\n==========================================")
+
+
+if __name__ == "__main__":
+    main()
