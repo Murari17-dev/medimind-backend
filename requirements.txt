@@ -9,3 +9,4 @@ openai
 pydantic
 Pillow
 httpx
+PyMuPDF
