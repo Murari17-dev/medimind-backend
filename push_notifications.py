@@ -94,7 +94,7 @@ def create_push_sender_router(engine):
                 CROSS JOIN LATERAL (
                     SELECT ((day_value::date + r.reminder_time) AT TIME ZONE r.timezone) AS scheduled_for
                     FROM generate_series(
-                        GREATEST(r.start_date, (NOW() AT TIME ZONE r.timezone)::date - 30)::timestamp,
+                        GREATEST(r.start_date, (NOW() AT TIME ZONE r.timezone)::date - 1)::timestamp,
                         LEAST(r.end_date, (NOW() AT TIME ZONE r.timezone)::date)::timestamp,
                         INTERVAL '1 day'
                     ) AS day_value
@@ -103,7 +103,7 @@ def create_push_sender_router(engine):
                     LIMIT 1
                 ) occurrence
                 WHERE r.enabled = TRUE
-                  AND occurrence.scheduled_for > NOW() - INTERVAL '31 days'
+                  AND occurrence.scheduled_for > NOW() - INTERVAL '1 day'
                   AND subs.subscriptions IS NOT NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM reminder_deliveries d
