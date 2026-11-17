@@ -80,10 +80,17 @@ def create_push_sender_router(engine):
         with engine.connect() as connection:
             due = connection.execute(text("""
                 SELECT r.id AS reminder_id, r.medication_name, r.dosage,
-                       r.instructions, s.user_id, s.endpoint, s.subscription,
+                       r.instructions, r.user_id, subs.subscriptions,
                        occurrence.scheduled_for
                 FROM medication_reminders r
-                JOIN reminder_push_subscriptions s ON s.user_id = r.user_id
+                CROSS JOIN LATERAL (
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'endpoint', s.endpoint,
+                        'subscription', s.subscription
+                    )) AS subscriptions
+                    FROM reminder_push_subscriptions s
+                    WHERE s.user_id = r.user_id
+                ) subs
                 CROSS JOIN LATERAL (
                     SELECT ((day_value::date + r.reminder_time) AT TIME ZONE r.timezone) AS scheduled_for
                     FROM generate_series(
@@ -97,6 +104,7 @@ def create_push_sender_router(engine):
                 ) occurrence
                 WHERE r.enabled = TRUE
                   AND occurrence.scheduled_for > NOW() - INTERVAL '31 days'
+                  AND subs.subscriptions IS NOT NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM reminder_deliveries d
                     WHERE d.reminder_id = r.id
@@ -139,15 +147,28 @@ def create_push_sender_router(engine):
                 ] if part) or "It is time to take your scheduled medication.",
                 "url": "/",
             }
-            try:
-                webpush(
-                    subscription_info=dict(item["subscription"]),
-                    data=json.dumps(body),
-                    vapid_private_key=private_key,
-                    vapid_claims={"sub": subject},
-                    ttl=86400,
-                )
-                with engine.begin() as connection:
+            successful_delivery = False
+            for subscription_record in item["subscriptions"]:
+                try:
+                    body["tag"] = f"medimind-{item['reminder_id']}-{item['scheduled_for'].isoformat()}"
+                    webpush(
+                        subscription_info=subscription_record["subscription"],
+                        data=json.dumps(body),
+                        vapid_private_key=private_key,
+                        vapid_claims={"sub": subject},
+                        ttl=86400,
+                    )
+                    successful_delivery = True
+                except WebPushException as error:
+                    status = getattr(getattr(error, "response", None), "status_code", None)
+                    if status in (404, 410):
+                        with engine.begin() as connection:
+                            connection.execute(text("""
+                                DELETE FROM reminder_push_subscriptions WHERE endpoint = :endpoint
+                            """), {"endpoint": subscription_record["endpoint"]})
+                    logger.warning("Push delivery failed with status %s", status)
+            with engine.begin() as connection:
+                if successful_delivery:
                     connection.execute(text("""
                         UPDATE reminder_deliveries
                         SET delivered_at = NOW(), lease_expires_at = NULL
@@ -159,15 +180,8 @@ def create_push_sender_router(engine):
                         "scheduled_for": item["scheduled_for"],
                         "token": token,
                     })
-                sent += 1
-            except WebPushException as error:
-                status = getattr(getattr(error, "response", None), "status_code", None)
-                if status in (404, 410):
-                    with engine.begin() as connection:
-                        connection.execute(text("""
-                            DELETE FROM reminder_push_subscriptions WHERE endpoint = :endpoint
-                        """), {"endpoint": item["endpoint"]})
-                with engine.begin() as connection:
+                    sent += 1
+                else:
                     connection.execute(text("""
                         UPDATE reminder_deliveries
                         SET lease_expires_at = NOW()
@@ -179,7 +193,6 @@ def create_push_sender_router(engine):
                         "scheduled_for": item["scheduled_for"],
                         "token": token,
                     })
-                logger.warning("Push delivery failed with status %s", status)
         return {"sent": sent, "skipped": skipped}
 
     return router
