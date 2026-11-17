@@ -140,12 +140,9 @@ def create_push_sender_router(engine):
                 continue
 
             body = {
-                "title": f"Medication reminder: {item['medication_name']}",
-                "body": " ".join(part for part in [
-                    item["dosage"] or "",
-                    item["instructions"] or "",
-                ] if part) or "It is time to take your scheduled medication.",
-                "url": "/",
+                "title": "MediMind medication reminder",
+                "body": "A medication reminder is due. Open MediMind to review your schedule.",
+                "url": "/reminders",
             }
             successful_delivery = False
             for subscription_record in item["subscriptions"]:
