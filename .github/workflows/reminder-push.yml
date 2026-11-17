@@ -1,0 +1,24 @@
+name: Send medication reminder push notifications
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger reminder delivery
+        env:
+          BACKEND_URL: ${{ secrets.MEDIMIND_BACKEND_URL }}
+          REMINDER_CRON_SECRET: ${{ secrets.REMINDER_CRON_SECRET }}
+        run: |
+          test -n "$BACKEND_URL"
+          test -n "$REMINDER_CRON_SECRET"
+          curl --fail --silent --show-error --max-time 90 \
+            -X POST "${BACKEND_URL%/}/api/v1/internal/send-reminder-push" \
+            -H "Authorization: Bearer $REMINDER_CRON_SECRET"

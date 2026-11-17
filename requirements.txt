@@ -9,3 +9,5 @@ openai
 pydantic
 Pillow
 httpx
+PyMuPDF
+pywebpush
