@@ -10,3 +10,4 @@ pydantic
 Pillow
 httpx
 PyMuPDF
+pywebpush
