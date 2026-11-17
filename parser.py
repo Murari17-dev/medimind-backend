@@ -25,7 +25,7 @@ from pydantic import (
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
 MODEL = os.getenv(
     "OPENROUTER_MODEL",
     "inclusionai/ling-3.2-flash:free",
