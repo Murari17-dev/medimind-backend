@@ -172,4 +172,23 @@ def create_creator_evaluation_router(engine, get_current_user):
             raise HTTPException(status_code=404, detail="Evaluation not found.")
         return dict(row)
 
+    @router.delete("/{job_id}", status_code=204)
+    def delete_evaluation(
+        job_id: str,
+        current_user: dict = Depends(get_current_user),
+    ):
+        require_creator(current_user)
+        with engine.begin() as connection:
+            deleted = connection.execute(
+                text("""
+                    DELETE FROM creator_evaluation_jobs
+                    WHERE id = :job_id AND user_id = CAST(:user_id AS UUID)
+                    RETURNING id
+                """),
+                {"job_id": job_id, "user_id": current_user["id"]},
+            ).first()
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Evaluation not found.")
+        return None
+
     return router
