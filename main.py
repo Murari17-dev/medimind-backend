@@ -169,24 +169,6 @@ def initialize_database():
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         """))
 
-        connection.execute(text("""
-            CREATE TABLE IF NOT EXISTS creator_evaluation_jobs (
-                id UUID PRIMARY KEY,
-                user_id UUID NOT NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'queued',
-                total_pages INTEGER NOT NULL,
-                completed_pages INTEGER NOT NULL DEFAULT 0,
-                results JSONB NOT NULL DEFAULT '[]'::jsonb,
-                error TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """))
-        connection.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_creator_evaluation_user_created
-            ON creator_evaluation_jobs (user_id, created_at DESC)
-        """))
-
     logger.info("Database initialization completed.")
 
 
