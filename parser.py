@@ -6,7 +6,7 @@ from io import BytesIO
 from typing import Literal
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError
 from PIL import Image, ImageEnhance, ImageOps
 from pydantic import (
     BaseModel,
@@ -485,9 +485,21 @@ Return JSON only.
                 temperature=0.1,
                 max_tokens=5000,
             )
+        except APIConnectionError as error:
+            logger.exception(
+                "OpenRouter connection failed on extraction attempt %s. "
+                "Underlying cause: %r",
+                attempt + 1,
+                error.__cause__,
+            )
+            raise RuntimeError(
+                "Could not connect to OpenRouter. Check Render outbound "
+                "network/DNS/TLS connectivity and inspect the underlying "
+                "cause in the server logs."
+            ) from error
         except Exception:
             logger.exception(
-                "OpenRouter request failed on extraction attempt %s.",
+                "OpenRouter API request failed on extraction attempt %s.",
                 attempt + 1,
             )
             raise
