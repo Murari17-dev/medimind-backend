@@ -5,7 +5,6 @@ from uuid import uuid4
 import fitz
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy import text
-from starlette.concurrency import run_in_threadpool
 
 from parser import parse_prescription_image
 
