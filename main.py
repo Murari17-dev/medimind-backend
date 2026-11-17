@@ -284,6 +284,11 @@ from reminders import create_reminder_router
 
 app.include_router(create_reminder_router(engine, get_current_user))
 
+from push_notifications import create_push_router, create_push_sender_router
+
+app.include_router(create_push_router(engine, get_current_user))
+app.include_router(create_push_sender_router(engine))
+
 from creator_evaluation import create_creator_evaluation_router
 
 app.include_router(create_creator_evaluation_router(engine, get_current_user))
