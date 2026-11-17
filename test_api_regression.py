@@ -181,27 +181,117 @@ def test_prescriptions_require_authentication(api):
 
 def test_list_prescriptions_uses_authenticated_user(api, monkeypatch):
     module, client = api
-    database = FakePrescriptionDatabase({
-        1: USER_A,
-        2: USER_B,
-        3: USER_A,
-    })
-    monkeypatch.setattr(module, "engine", database)
-
     calls = []
 
-    def fake_build(prescription_id, user_id):
-        calls.append((prescription_id, user_id))
-        return prescription_response(module, prescription_id)
+    def fake_fetch(user_id, prescription_id=None):
+        calls.append((user_id, prescription_id))
+        return [prescription_response(module, 3), prescription_response(module, 1)]
 
-    monkeypatch.setattr(module, "build_prescription_response", fake_build)
+    monkeypatch.setattr(module, "fetch_prescriptions", fake_fetch)
 
     response = client.get("/api/v1/prescriptions")
 
     assert response.status_code == 200
     assert [item["id"] for item in response.json()] == [3, 1]
-    assert calls == [(3, USER_A), (1, USER_A)]
-    assert database.calls[0][1] == {"user_id": USER_A}
+    assert calls == [(USER_A, None)]
+
+
+class FakeMappingResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self.rows
+
+
+class FakeBatchDatabase:
+    """Records every query so the test can prove the list is not N+1."""
+
+    def __init__(self, prescriptions, medications):
+        self.prescriptions = prescriptions
+        self.medications = medications
+        self.calls = []
+
+    @contextmanager
+    def connect(self):
+        yield self
+
+    def execute(self, statement, parameters):
+        sql = str(statement)
+        self.calls.append((sql, dict(parameters)))
+
+        if "FROM prescriptions" in sql:
+            return FakeMappingResult(self.prescriptions)
+
+        if "FROM medications" in sql:
+            return FakeMappingResult(self.medications)
+
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+
+def medication_row(prescription_id, name):
+    return {
+        "prescription_id": prescription_id,
+        "name": name,
+        "dosage": "5 mg",
+        "instructions": None,
+        "times_of_day": '["Morning"]',
+        "frequency_per_day": 1,
+        "duration_days": 5,
+        "verification_note": None,
+        "raw_transcription": None,
+        "name_confidence": None,
+        "dosage_confidence": "high",
+        "frequency_confidence": "medium",
+    }
+
+
+def test_fetch_prescriptions_loads_everything_in_two_queries(api, monkeypatch):
+    module, _ = api
+    database = FakeBatchDatabase(
+        prescriptions=[
+            {"id": 3, "doctor_notes": "Second", "created_at": None},
+            {"id": 1, "doctor_notes": None, "created_at": None},
+        ],
+        medications=[
+            medication_row(3, "Alpha"),
+            medication_row(3, "Beta"),
+            medication_row(1, "Gamma"),
+        ],
+    )
+    monkeypatch.setattr(module, "engine", database)
+
+    results = module.fetch_prescriptions(USER_A)
+
+    assert len(database.calls) == 2
+    assert database.calls[0][1]["user_id"] == USER_A
+    assert database.calls[1][1] == {"ids": [3, 1]}
+    assert [item.id for item in results] == [3, 1]
+    assert [m.name for m in results[0].medications] == ["Alpha", "Beta"]
+    assert [m.name for m in results[1].medications] == ["Gamma"]
+    assert results[0].medications[0].times_of_day == ["Morning"]
+    assert results[0].medications[0].name_confidence == "low"
+
+
+def test_fetch_prescriptions_skips_medication_query_when_empty(api, monkeypatch):
+    module, _ = api
+    database = FakeBatchDatabase(prescriptions=[], medications=[])
+    monkeypatch.setattr(module, "engine", database)
+
+    assert module.fetch_prescriptions(USER_A) == []
+    assert len(database.calls) == 1
+
+
+def test_health_endpoint(api):
+    _, client = api
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 def test_delete_prescription_cannot_delete_another_users_record(api, monkeypatch):
@@ -276,6 +366,7 @@ def test_parse_prescription_preserves_response_format(api, monkeypatch):
     assert response.json() == {
         "id": 42,
         "doctor_notes": "Review",
+        "created_at": None,
         "medications": [{
             "name": "Example",
             "dosage": "5 mg",
@@ -345,3 +436,43 @@ def test_parse_validation_error_does_not_save(api, monkeypatch):
     assert response.status_code == 422
     assert response.json() == {"detail": "Invalid image"}
     assert saved == []
+
+
+def test_token_verification_is_cached_per_token(api, monkeypatch):
+    import asyncio
+
+    module, _ = api
+    module._auth_cache.clear()
+    lookups = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"id": USER_A}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers):
+            lookups.append(headers["Authorization"])
+            return FakeResponse()
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+
+    def credentials(token):
+        return SimpleNamespace(scheme="Bearer", credentials=token)
+
+    first = asyncio.run(module.get_current_user(credentials("token-1")))
+    second = asyncio.run(module.get_current_user(credentials("token-1")))
+    asyncio.run(module.get_current_user(credentials("token-2")))
+
+    assert first == second == {"id": USER_A}
+    assert lookups == ["Bearer token-1", "Bearer token-2"]
