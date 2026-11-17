@@ -1,4 +1,3 @@
-
 import os
 import re
 import base64
@@ -19,11 +18,35 @@ from pydantic import (
 )
 
 
+# --------------------------------------------------
+# ENVIRONMENT AND OPENROUTER CONFIGURATION
+# --------------------------------------------------
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-MODEL = os.getenv("AIROUTER_MODEL", "openai/gpt-6-luna")
-AIROUTER_BASE_URL = "https://api.airouter.in/v1"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "inclusionai/ling-3.2-flash:free",
+)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+logger = logging.getLogger(__name__)
+
+if not OPENROUTER_API_KEY:
+    raise RuntimeError(
+        "OPENROUTER_API_KEY is missing. Set it in your environment "
+        "or in the .env file."
+    )
+
+# Reuse one client rather than creating a new client for every image.
+client = OpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url=OPENROUTER_BASE_URL,
+    max_retries=1,
+    timeout=120.0,
+)
 
 # One initial extraction plus at most two repair attempts.
 MAX_REPAIR_ATTEMPTS = 2
@@ -36,8 +59,10 @@ TIME_OF_DAY_LABELS = {
 
 CLOCK_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
-logger = logging.getLogger(__name__)
 
+# --------------------------------------------------
+# PYDANTIC EXTRACTION MODELS
+# --------------------------------------------------
 
 class MedicationExtraction(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -152,6 +177,10 @@ class PrescriptionExtraction(BaseModel):
     )
 
 
+# --------------------------------------------------
+# IMAGE PROCESSING
+# --------------------------------------------------
+
 def encode_image(image_bytes: bytes, mime_type: str) -> str:
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime_type};base64,{encoded}"
@@ -168,14 +197,13 @@ def preprocess_image(image_bytes: bytes) -> bytes:
     - Improve contrast and sharpness.
     - Resize very large images.
     """
-
     with Image.open(BytesIO(image_bytes)) as source:
         image = ImageOps.exif_transpose(source)
         image = image.convert("RGB")
 
         image = ImageOps.autocontrast(
             image,
-            cutoff=1
+            cutoff=1,
         )
 
         image = ImageEnhance.Contrast(image).enhance(1.25)
@@ -186,7 +214,7 @@ def preprocess_image(image_bytes: bytes) -> bytes:
         if max(image.size) > max_dimension:
             image.thumbnail(
                 (max_dimension, max_dimension),
-                Image.Resampling.LANCZOS
+                Image.Resampling.LANCZOS,
             )
 
         output = BytesIO()
@@ -195,11 +223,15 @@ def preprocess_image(image_bytes: bytes) -> bytes:
             output,
             format="JPEG",
             quality=92,
-            optimize=True
+            optimize=True,
         )
 
         return output.getvalue()
 
+
+# --------------------------------------------------
+# VALIDATION AND REPAIR HELPERS
+# --------------------------------------------------
 
 def describe_validation_error(error: ValidationError) -> str:
     return "; ".join(
@@ -221,20 +253,28 @@ def build_repair_message(error: ValidationError) -> str:
     )
 
 
+# --------------------------------------------------
+# MAIN PRESCRIPTION EXTRACTION FUNCTION
+# --------------------------------------------------
+
 def parse_prescription_image(
     image_bytes: bytes,
-    mime_type: str
+    mime_type: str,
 ) -> PrescriptionExtraction:
+    """
+    Extract prescription information using the OpenRouter vision model.
 
-    api_key = os.getenv("AIROUTER_API_KEY")
+    The function signature and returned Pydantic schema are kept
+    compatible with the existing FastAPI application.
+    """
 
-    if not api_key:
-        raise RuntimeError("AIROUTER_API_KEY is missing.")
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing.")
 
     if mime_type not in (
         "image/jpeg",
         "image/png",
-        "image/webp"
+        "image/webp",
     ):
         raise ValueError(
             "Only JPEG, PNG and WEBP images are supported."
@@ -253,12 +293,12 @@ def parse_prescription_image(
 
     original_image_url = encode_image(
         image_bytes,
-        mime_type
+        mime_type,
     )
 
     enhanced_image_url = encode_image(
         enhanced_bytes,
-        "image/jpeg"
+        "image/jpeg",
     )
 
     instructions = """
@@ -395,22 +435,15 @@ Use 0 for unknown numeric values.
 Return JSON only.
 """
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url=AIROUTER_BASE_URL,
-        timeout=75.0,
-        max_retries=1
-    )
-
     logger.info(
-        "Starting prescription extraction using model %s",
-        MODEL
+        "Starting prescription extraction using OpenRouter model %s",
+        MODEL,
     )
 
     messages = [
         {
             "role": "system",
-            "content": instructions
+            "content": instructions,
         },
         {
             "role": "user",
@@ -422,44 +455,50 @@ Return JSON only.
                         "Transcribe every medication separately. "
                         "Preserve partial readings, extract each "
                         "field independently, and flag uncertainty."
-                    )
+                    ),
                 },
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": original_image_url
-                    }
+                        "url": original_image_url,
+                    },
                 },
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": enhanced_image_url
-                    }
-                }
-            ]
-        }
+                        "url": enhanced_image_url,
+                    },
+                },
+            ],
+        },
     ]
 
     extraction = None
     last_error = None
 
     for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
-
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.1,
-            max_tokens=5000
-        )
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=5000,
+            )
+        except Exception:
+            logger.exception(
+                "OpenRouter request failed on extraction attempt %s.",
+                attempt + 1,
+            )
+            raise
 
         result = response.choices[0].message.content
 
         if not result:
-            last_error = "GPT-6 Luna returned an empty response."
+            last_error = f"{MODEL} returned an empty response."
             logger.warning(
                 "Prescription extraction attempt %s returned no content.",
-                attempt + 1
+                attempt + 1,
             )
             messages.append(
                 {
@@ -468,7 +507,7 @@ Return JSON only.
                         "The previous response was empty. Return the JSON "
                         "object only, using exactly the documented "
                         "structure. Do not invent medication information."
-                    )
+                    ),
                 }
             )
             continue
@@ -483,18 +522,18 @@ Return JSON only.
             logger.warning(
                 "Prescription extraction attempt %s failed validation: %s",
                 attempt + 1,
-                describe_validation_error(error)
+                describe_validation_error(error),
             )
             messages.append(
                 {
                     "role": "assistant",
-                    "content": result
+                    "content": result,
                 }
             )
             messages.append(
                 {
                     "role": "user",
-                    "content": build_repair_message(error)
+                    "content": build_repair_message(error),
                 }
             )
 
@@ -511,7 +550,7 @@ Return JSON only.
 
     logger.info(
         "Prescription extraction completed: %s medications",
-        len(extraction.medications)
+        len(extraction.medications),
     )
 
     return extraction
