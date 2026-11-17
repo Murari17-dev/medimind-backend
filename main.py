@@ -1,6 +1,9 @@
+import hashlib
 import json
 import logging
 import os
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +41,20 @@ if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+# Comma-separated list of allowed browser origins. "*" is only a fallback for
+# local development; set ALLOWED_ORIGINS in production.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
+# Supabase validates every bearer token over the network. A short cache avoids
+# repeating that round trip for the burst of requests each screen makes.
+AUTH_CACHE_TTL_SECONDS = 30
+AUTH_CACHE_MAX_ENTRIES = 1024
+_auth_cache: dict[str, tuple[float, dict]] = {}
 
 
 # --------------------------------------------------
@@ -86,7 +103,6 @@ def initialize_database():
         connection.execute(text("ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"))
 
         migrations = [
-            "ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS user_id UUID",
             """
             ALTER TABLE medications
             ADD COLUMN IF NOT EXISTS verification_note TEXT
@@ -114,6 +130,15 @@ def initialize_database():
 
         for migration in migrations:
             connection.execute(text(migration))
+
+        connection.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_prescriptions_user
+            ON prescriptions (user_id, created_at DESC)
+        """))
+        connection.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_medications_prescription
+            ON medications (prescription_id)
+        """))
 
         # Medication reminders and durable delivery claims.
         connection.execute(text("""
@@ -204,6 +229,7 @@ class MedicationResponse(BaseModel):
 class PrescriptionResponse(BaseModel):
     id: int
     doctor_notes: Optional[str] = None
+    created_at: Optional[datetime] = None
     medications: list[MedicationResponse]
 
 
@@ -219,10 +245,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -238,6 +264,13 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Sign in to continue.")
 
     token = credentials.credentials
+    cache_key = hashlib.sha256(token.encode()).hexdigest()
+    now = time.monotonic()
+
+    cached = _auth_cache.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
@@ -248,10 +281,19 @@ async def get_current_user(
                 },
             )
         if response.status_code != 200:
+            _auth_cache.pop(cache_key, None)
             raise HTTPException(status_code=401, detail="Your session is invalid or expired. Please sign in again.")
         user = response.json()
         if not user.get("id"):
             raise HTTPException(status_code=401, detail="Unable to verify your account.")
+
+        if len(_auth_cache) >= AUTH_CACHE_MAX_ENTRIES:
+            for key in [k for k, (expires, _) in _auth_cache.items() if expires <= now]:
+                del _auth_cache[key]
+            if len(_auth_cache) >= AUTH_CACHE_MAX_ENTRIES:
+                _auth_cache.clear()
+        _auth_cache[cache_key] = (now + AUTH_CACHE_TTL_SECONDS, user)
+
         return user
     except httpx.HTTPError:
         logger.exception("Supabase Auth verification failed")
@@ -363,25 +405,36 @@ def save_prescription(extraction, user_id):
     return prescription_id
 
 
-def build_prescription_response(prescription_id, user_id):
+def fetch_prescriptions(user_id, prescription_id=None):
+    """Load a user's prescriptions with their medications in two queries.
+
+    Pass prescription_id to load a single owned prescription. Ownership is
+    always enforced by the user_id filter.
+    """
 
     with engine.connect() as connection:
 
-        prescription = connection.execute(
+        prescriptions = connection.execute(
             text("""
-                SELECT id, doctor_notes
+                SELECT id, doctor_notes, created_at
                 FROM prescriptions
-                WHERE id = :id AND user_id = CAST(:user_id AS UUID)
+                WHERE user_id = CAST(:user_id AS UUID)
+                  AND (
+                      CAST(:prescription_id AS BIGINT) IS NULL
+                      OR id = CAST(:prescription_id AS BIGINT)
+                  )
+                ORDER BY created_at DESC, id DESC
             """),
-            {"id": prescription_id, "user_id": user_id}
-        ).mappings().first()
+            {"user_id": user_id, "prescription_id": prescription_id}
+        ).mappings().all()
 
-        if not prescription:
-            return None
+        if not prescriptions:
+            return []
 
         medications = connection.execute(
             text("""
                 SELECT
+                    prescription_id,
                     name,
                     dosage,
                     instructions,
@@ -394,36 +447,47 @@ def build_prescription_response(prescription_id, user_id):
                     dosage_confidence,
                     frequency_confidence
                 FROM medications
-                WHERE prescription_id = :prescription_id
-                ORDER BY id
+                WHERE prescription_id = ANY(CAST(:ids AS BIGINT[]))
+                ORDER BY prescription_id, id
             """),
-            {
-                "prescription_id": prescription_id
-            }
+            {"ids": [row["id"] for row in prescriptions]}
         ).mappings().all()
 
-        return PrescriptionResponse(
+    medications_by_prescription = {}
+
+    for medication in medications:
+        medications_by_prescription.setdefault(
+            medication["prescription_id"], []
+        ).append(
+            MedicationResponse(
+                name=medication["name"] or "",
+                dosage=medication["dosage"] or "",
+                instructions=medication["instructions"] or "",
+                times_of_day=decode_times(medication["times_of_day"]),
+                frequency_per_day=medication["frequency_per_day"],
+                duration_days=medication["duration_days"],
+                verification_note=medication["verification_note"],
+                raw_transcription=medication["raw_transcription"],
+                name_confidence=medication["name_confidence"] or "low",
+                dosage_confidence=medication["dosage_confidence"] or "low",
+                frequency_confidence=medication["frequency_confidence"] or "low",
+            )
+        )
+
+    return [
+        PrescriptionResponse(
             id=prescription["id"],
             doctor_notes=prescription["doctor_notes"],
-            medications=[
-                MedicationResponse(
-                    name=medication["name"] or "",
-                    dosage=medication["dosage"] or "",
-                    instructions=medication["instructions"] or "",
-                    times_of_day=decode_times(
-                        medication["times_of_day"]
-                    ),
-                    frequency_per_day=medication["frequency_per_day"],
-                    duration_days=medication["duration_days"],
-                    verification_note=medication["verification_note"],
-                    raw_transcription=medication["raw_transcription"],
-                    name_confidence=medication["name_confidence"] or "low",
-                    dosage_confidence=medication["dosage_confidence"] or "low",
-                    frequency_confidence=medication["frequency_confidence"] or "low",
-                )
-                for medication in medications
-            ]
+            created_at=prescription["created_at"],
+            medications=medications_by_prescription.get(prescription["id"], []),
         )
+        for prescription in prescriptions
+    ]
+
+
+def build_prescription_response(prescription_id, user_id):
+    results = fetch_prescriptions(user_id, prescription_id)
+    return results[0] if results else None
 
 
 # --------------------------------------------------
@@ -440,25 +504,19 @@ def home():
     }
 
 
-@app.get("/api/v1/prescriptions")
+@app.get("/health")
+def health():
+
+    return {"status": "ok"}
+
+
+@app.get(
+    "/api/v1/prescriptions",
+    response_model=list[PrescriptionResponse]
+)
 def get_prescriptions(current_user: dict = Depends(get_current_user)):
 
-    with engine.connect() as connection:
-
-        prescriptions = connection.execute(
-            text("""
-                SELECT id
-                FROM prescriptions
-                WHERE user_id = CAST(:user_id AS UUID)
-                ORDER BY created_at DESC, id DESC
-            """),
-            {"user_id": current_user["id"]}
-        ).fetchall()
-
-    return [
-        build_prescription_response(row.id, current_user["id"])
-        for row in prescriptions
-    ]
+    return fetch_prescriptions(current_user["id"])
 
 
 @app.delete("/api/v1/prescriptions/{prescription_id}")

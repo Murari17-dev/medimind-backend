@@ -16,33 +16,59 @@ def make_png():
     return output.getvalue()
 
 
-def test_current_models_supply_defaults():
+def complete_medication(**overrides):
+    medication = {
+        "name": "Example",
+        "dosage": "5 mg",
+        "frequency_per_day": 2,
+        "times_of_day": ["Morning", "Night"],
+        "duration_days": 5,
+        "instructions": "After food",
+        "raw_transcription": "Example 5 mg",
+        "name_confidence": "high",
+        "dosage_confidence": "high",
+        "frequency_confidence": "medium",
+    }
+    medication.update(overrides)
+    return medication
+
+
+def fake_client(responses, calls):
+    """Return a client whose completions yield each response in turn."""
+    queue = list(responses)
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        content = queue.pop(0)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    return SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+
+def test_prescription_model_supplies_defaults():
     extraction = parser.PrescriptionExtraction.model_validate({})
 
     assert extraction.doctor_notes == ""
     assert extraction.medications == []
 
-    medication = parser.MedicationExtraction.model_validate({})
-    assert medication.name == "Unknown"
-    assert medication.frequency_per_day == 0
-    assert medication.times_of_day == []
-    assert medication.name_confidence == "low"
+
+def test_medication_model_requires_every_field_so_the_model_must_retry():
+    with pytest.raises(ValidationError, match="missing required medication fields"):
+        parser.MedicationExtraction.model_validate({})
 
 
-def test_current_models_coerce_integer_strings_and_ignore_extra_fields():
-    extraction = parser.PrescriptionExtraction.model_validate_json(
-        json.dumps({
-            "extra": "ignored",
-            "medications": [{
-                "frequency_per_day": "2",
-                "extra": "ignored",
-            }],
-        })
-    )
+def test_models_reject_extra_fields_and_wrong_types():
+    with pytest.raises(ValidationError):
+        parser.PrescriptionExtraction.model_validate({"extra": "nope"})
 
-    assert extraction.medications[0].frequency_per_day == 2
-    assert "extra" not in extraction.model_dump()
-    assert "extra" not in extraction.medications[0].model_dump()
+    with pytest.raises(ValidationError):
+        parser.MedicationExtraction.model_validate(
+            complete_medication(frequency_per_day="2")
+        )
 
 
 @pytest.mark.parametrize(
@@ -53,9 +79,39 @@ def test_current_models_coerce_integer_strings_and_ignore_extra_fields():
         '{"medications": [{"frequency_per_day": "not an integer"}]}',
     ],
 )
-def test_current_models_reject_invalid_json_or_field_types(payload):
+def test_models_reject_invalid_json_or_field_types(payload):
     with pytest.raises(ValidationError):
         parser.PrescriptionExtraction.model_validate_json(payload)
+
+
+def test_times_of_day_are_normalised_and_validated():
+    medication = parser.MedicationExtraction.model_validate(
+        complete_medication(times_of_day=["morning", "20:30"])
+    )
+
+    assert medication.times_of_day == ["Morning", "20:30"]
+
+    with pytest.raises(ValidationError):
+        parser.MedicationExtraction.model_validate(
+            complete_medication(times_of_day=["teatime"])
+        )
+
+
+def test_missing_information_is_recorded_not_invented():
+    medication = parser.MedicationExtraction.model_validate(
+        complete_medication(
+            name=" ",
+            dosage="",
+            frequency_per_day=0,
+            duration_days=0,
+        )
+    )
+
+    assert medication.name == "Unknown"
+    assert "Medication name could not be read" in medication.verification_note
+    assert "Dosage was not visible" in medication.verification_note
+    assert "Frequency could not be determined" in medication.verification_note
+    assert "Duration was not visible" in medication.verification_note
 
 
 def test_encode_image_preserves_bytes_and_mime_type():
@@ -67,50 +123,20 @@ def test_encode_image_preserves_bytes_and_mime_type():
     )
 
 
-def test_parse_normalises_existing_fields_and_sends_two_views(monkeypatch):
-    monkeypatch.setenv("AIROUTER_API_KEY", "test-key")
+def test_parse_sends_original_and_enhanced_views(monkeypatch):
     calls = []
     response_json = json.dumps({
         "doctor_notes": "Review",
-        "medications": [{
-            "name": " ",
-            "frequency_per_day": -2,
-            "duration_days": -3,
-            "name_confidence": " HIGH ",
-            "dosage_confidence": "unexpected",
-            "frequency_confidence": "Medium",
-        }],
+        "medications": [complete_medication()],
     })
-
-    def fake_create(**kwargs):
-        calls.append(kwargs)
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=response_json)
-                )
-            ]
-        )
-
-    def fake_openai(**kwargs):
-        assert kwargs["api_key"] == "test-key"
-        return SimpleNamespace(
-            chat=SimpleNamespace(
-                completions=SimpleNamespace(create=fake_create)
-            )
-        )
-
-    monkeypatch.setattr(parser, "OpenAI", fake_openai)
+    monkeypatch.setattr(parser, "client", fake_client([response_json], calls))
 
     extraction = parser.parse_prescription_image(make_png(), "image/png")
 
     medication = extraction.medications[0]
     assert extraction.doctor_notes == "Review"
-    assert medication.name == "Unknown"
-    assert medication.frequency_per_day == 0
-    assert medication.duration_days == 0
-    assert medication.name_confidence == "high"
-    assert medication.dosage_confidence == "low"
+    assert medication.name == "Example"
+    assert medication.frequency_per_day == 2
     assert medication.frequency_confidence == "medium"
 
     assert len(calls) == 1
@@ -121,43 +147,65 @@ def test_parse_normalises_existing_fields_and_sends_two_views(monkeypatch):
     assert images[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
-def test_parse_rejects_invalid_model_output_without_repair(monkeypatch):
-    monkeypatch.setenv("AIROUTER_API_KEY", "test-key")
+def test_parse_repairs_invalid_output_with_a_follow_up_request(monkeypatch):
     calls = []
+    valid = json.dumps({"doctor_notes": "", "medications": [complete_medication()]})
+    monkeypatch.setattr(
+        parser, "client", fake_client(["not json", valid], calls)
+    )
 
-    def fake_create(**kwargs):
-        calls.append(kwargs)
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content="not json")
-                )
-            ]
-        )
+    extraction = parser.parse_prescription_image(make_png(), "image/png")
+
+    assert len(extraction.medications) == 1
+    assert len(calls) == 2
+    repair_request = calls[1]["messages"][-1]["content"]
+    assert "failed validation" in repair_request
+
+
+def test_parse_gives_up_after_the_repair_budget(monkeypatch):
+    calls = []
+    attempts = parser.MAX_REPAIR_ATTEMPTS + 1
+    monkeypatch.setattr(
+        parser, "client", fake_client(["not json"] * attempts, calls)
+    )
+
+    with pytest.raises(ValueError, match="failed validation after"):
+        parser.parse_prescription_image(make_png(), "image/png")
+
+    assert len(calls) == attempts
+
+
+def test_parse_rejects_unsupported_mime_before_calling_provider(monkeypatch):
+    def unexpected_call(**kwargs):
+        raise AssertionError("Provider must not be called")
 
     monkeypatch.setattr(
         parser,
-        "OpenAI",
-        lambda **kwargs: SimpleNamespace(
+        "client",
+        SimpleNamespace(
             chat=SimpleNamespace(
-                completions=SimpleNamespace(create=fake_create)
+                completions=SimpleNamespace(create=unexpected_call)
             )
         ),
     )
 
-    with pytest.raises(ValidationError):
-        parser.parse_prescription_image(make_png(), "image/png")
-
-    assert len(calls) == 1
-
-
-def test_parse_rejects_unsupported_mime_before_calling_provider(monkeypatch):
-    monkeypatch.setenv("AIROUTER_API_KEY", "test-key")
-
-    def unexpected_client(**kwargs):
-        raise AssertionError("Provider must not be called")
-
-    monkeypatch.setattr(parser, "OpenAI", unexpected_client)
-
     with pytest.raises(ValueError, match="Only JPEG"):
         parser.parse_prescription_image(make_png(), "text/plain")
+
+
+def test_parse_rejects_undecodable_image_before_calling_provider(monkeypatch):
+    def unexpected_call(**kwargs):
+        raise AssertionError("Provider must not be called")
+
+    monkeypatch.setattr(
+        parser,
+        "client",
+        SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=unexpected_call)
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="could not be processed"):
+        parser.parse_prescription_image(b"not an image", "image/png")
